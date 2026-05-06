@@ -2,7 +2,7 @@
 
 A beautiful floating music widget for Linux — frameless, always-on-top, with dynamic colors extracted from album art. Inspired by macOS widgets, Rainmeter, Hyprland rice setups, and the Spotify aesthetic.    
 
-![Img_1](Img_1.png)
+![Img_0](Img_0.png)
 
 
 (Works in theory)

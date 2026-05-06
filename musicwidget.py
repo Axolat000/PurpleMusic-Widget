@@ -1,34 +1,20 @@
 #!/usr/bin/env python3
 """
-Aurora Music Widget  v4
+Aurora Music Widget — Linux
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Resizable floating card · animated accent glow · right-click settings
-Cross-platform: Linux · macOS · Windows · FreeBSD
+MPRIS2 via DBus · Wayland + X11
 
-Media backends
-──────────────
-  Linux / FreeBSD  →  MPRIS2 via DBus
-  macOS            →  Now Playing (ScriptingBridge + osascript fallback)
-  Windows          →  SMTC via winsdk  (pip install winsdk)
-
-Resize
-──────
-  Drag any edge or corner to resize freely.
-  Minimum: 220 × 300.  All UI scales proportionally.
+Resize: drag any edge or corner. Minimum 220×300.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 from __future__ import annotations
-import sys, os, io, json, time, threading, urllib.request, math, subprocess
+import sys, os, io, json, time, threading, urllib.request, math
 from pathlib import Path
 from typing  import Optional
 
-# ── Platform detection ────────────────────────────────────────────────────────
-IS_WIN  = sys.platform == "win32"
-IS_MAC  = sys.platform == "darwin"
-IS_BSD  = "bsd" in sys.platform
-IS_LIN  = sys.platform.startswith("linux")
-IS_UNIX = IS_LIN or IS_BSD or IS_MAC
+# Linux only
 
 # ── PyQt6 ─────────────────────────────────────────────────────────────────────
 try:
@@ -53,43 +39,15 @@ try:
 except ImportError:
     COLOR_OK = False
 
-# ── Backend-specific imports ──────────────────────────────────────────────────
-DBUS_OK  = False
-WINRT_OK = False
-MAC_SB   = False   # ScriptingBridge available
+# ── DBus / MPRIS2 ─────────────────────────────────────────────────────────────
+DBUS_OK = False
+try:
+    import dbus
+    DBUS_OK = True
+except ImportError:
+    print("[aurora] dbus-python not found — demo mode")
 
-if IS_LIN or IS_BSD:
-    try:
-        import dbus
-        DBUS_OK = True
-    except ImportError:
-        print("[aurora] dbus-python not found — demo mode")
-
-if IS_WIN:
-    try:
-        import asyncio
-        from winsdk.windows.media.control import (
-            GlobalSystemMediaTransportControlsSessionManager as _WinMgr,
-        )
-        from winsdk.windows.storage.streams import DataReader, Buffer, InputStreamOptions
-        WINRT_OK = True
-    except Exception as e:
-        print(f"[aurora] winsdk: {e}  →  pip install winsdk")
-
-if IS_MAC:
-    try:
-        import ScriptingBridge  # noqa
-        MAC_SB = True
-    except ImportError:
-        pass   # osascript fallback used automatically
-
-# ── Config path ───────────────────────────────────────────────────────────────
-if IS_WIN:
-    CFG_PATH = Path(os.environ.get("APPDATA", Path.home()/"AppData"/"Roaming")) / "aurora-widget" / "settings.json"
-elif IS_MAC:
-    CFG_PATH = Path.home() / "Library" / "Application Support" / "aurora-widget" / "settings.json"
-else:
-    CFG_PATH = Path.home() / ".config" / "aurora-widget" / "settings.json"
+CFG_PATH = Path.home() / ".config" / "aurora-widget" / "settings.json"
 
 # ── Design constants (base card size; actual dims come from window size) ──────
 GLOW_PAD    = 36          # transparent border for glow bleed
@@ -263,176 +221,6 @@ class DBusBackend:
         except: return None
 
 
-class MacBackend:
-    """macOS — ScriptingBridge with osascript fallback."""
-    _APPS = ["Spotify","Music","iTunes","VLC"]
-
-    def __init__(self):
-        self._art_cache: dict[str,Optional[bytes]] = {}
-        self._sb: dict = {}
-        if MAC_SB:
-            import ScriptingBridge as SB
-            _bundles = {"Spotify":"com.spotify.client","Music":"com.apple.Music",
-                        "iTunes":"com.apple.iTunes","VLC":"org.videolan.vlc"}
-            for app in self._APPS:
-                try:
-                    a = SB.SBApplication.applicationWithBundleIdentifier_(_bundles.get(app,""))
-                    if a: self._sb[app]=a
-                except: pass
-
-    def poll(self) -> Track:
-        if self._sb:
-            for name,app in self._sb.items():
-                try:
-                    t=self._from_sb(name,app)
-                    if t and t.title and t.title!="No media playing": return t
-                except: pass
-        return self._from_osascript()
-
-    def _from_sb(self, name: str, app) -> Optional[Track]:
-        try:
-            state=str(app.playerState())
-            playing="play" in state.lower() or state=="1800426323"
-            tr=app.currentTrack(); t=Track()
-            t.player=name; t.playing=playing
-            t.title =str(tr.name()   or "")
-            t.artist=str(tr.artist() or "")
-            t.album =str(tr.album()  or "")
-            t.duration=int((tr.duration()      or 0)*1_000_000)
-            t.position=int((app.playerPosition() or 0)*1_000_000)
-            try:
-                uri=str(tr.id() or "")
-                if "spotify:track:" in uri:
-                    tid=uri.split("spotify:track:")[-1]; t.art_url=f"sptk:{tid}"
-                    if tid not in self._art_cache:
-                        self._art_cache[tid]=self._spotify_art(tid)
-                    t.art_bytes=self._art_cache.get(tid)
-            except: pass
-            return t
-        except: return None
-
-    def _from_osascript(self) -> Track:
-        t=Track()
-        script=(
-            'set out to ""\n'
-            'repeat with a in {"Spotify","Music","iTunes","VLC"}\n'
-            '  try\n'
-            '    tell application a\n'
-            '      if player state is playing then\n'
-            '        set tr to current track\n'
-            '        set out to (name of tr)&"|"&(artist of tr)&"|"&(album of tr)&"|"&'
-            '(duration of tr)&"|"&(player position)&"|"&a\n'
-            '      end if\n'
-            '    end tell\n'
-            '  end try\n'
-            'end repeat\n'
-            'return out'
-        )
-        try:
-            out=subprocess.check_output(["osascript","-e",script],
-                                        stderr=subprocess.DEVNULL,timeout=4).decode().strip()
-            if "|" in out:
-                parts=out.split("|")
-                t.title =parts[0] if len(parts)>0 else ""
-                t.artist=parts[1] if len(parts)>1 else ""
-                t.album =parts[2] if len(parts)>2 else ""
-                try: t.duration=int(float(parts[3])*1_000_000) if len(parts)>3 else 0
-                except: pass
-                try: t.position=int(float(parts[4])*1_000_000) if len(parts)>4 else 0
-                except: pass
-                t.player=parts[5].strip() if len(parts)>5 else "macOS"; t.playing=True
-        except Exception as e: print(f"[mac] {e}")
-        return t
-
-    def cmd(self, player: str, c: str):
-        mac_c={"PlayPause":"playpause","Next":"next track","Previous":"previous track"}.get(c)
-        if not mac_c or not player: return
-        try: subprocess.run(["osascript","-e",f'tell application "{player}" to {mac_c}'],
-                            timeout=3,capture_output=True)
-        except: pass
-
-    def seek(self, player: str, frac: float):
-        if not player: return
-        try:
-            script=f'tell application "{player}" to set player position to (duration of current track)*{frac}'
-            subprocess.run(["osascript","-e",script],timeout=3,capture_output=True)
-        except: pass
-
-    @staticmethod
-    def _spotify_art(tid: str) -> Optional[bytes]:
-        try:
-            url=f"https://open.spotify.com/oembed?url=spotify:track:{tid}"
-            data=json.loads(urllib.request.urlopen(url,timeout=5).read())
-            thumb=data.get("thumbnail_url","")
-            if thumb:
-                return urllib.request.urlopen(
-                    urllib.request.Request(thumb,headers={"User-Agent":"aurora/4"}),timeout=5).read()
-        except: return None
-
-
-class WindowsBackend:
-    """Windows — SMTC via winsdk."""
-    def __init__(self):
-        self._loop=None; self._mgr=None; self._art_url=""; self._art_bytes=None
-        if WINRT_OK:
-            try:
-                self._loop=asyncio.new_event_loop()
-                self._mgr=self._loop.run_until_complete(_WinMgr.request_async())
-            except Exception as e: print(f"[smtc] init: {e}")
-
-    def poll(self) -> Track:
-        t=Track()
-        if not self._mgr or not self._loop: return t
-        try:
-            sess=self._mgr.get_current_session()
-            if not sess: return t
-            info=self._loop.run_until_complete(sess.try_get_media_properties_async())
-            if not info: return t
-            pb=sess.get_playback_info(); tl=sess.get_timeline_properties()
-            t.player=str(getattr(sess,"source_app_user_model_id","Windows") or "Windows")
-            t.title =info.title       or "Unknown"
-            t.artist=info.artist      or ""
-            t.album =info.album_title or ""
-            t.playing=(pb.playback_status.value==4)  # 4 = Playing
-            try:
-                t.duration=tl.end_time.duration//10
-                t.position=tl.position.duration//10
-            except: pass
-            try:
-                thumb=info.thumbnail
-                if thumb:
-                    stream=self._loop.run_until_complete(thumb.open_read_async())
-                    sz=stream.size; buf=Buffer(sz)
-                    self._loop.run_until_complete(stream.read_async(buf,sz,InputStreamOptions.READ_AHEAD))
-                    rdr=DataReader.from_buffer(buf)
-                    data=bytes(rdr.read_buffer(sz))
-                    key=f"smtc:{t.title[:30]}"
-                    if key!=self._art_url:
-                        self._art_bytes=data; self._art_url=key
-                    t.art_bytes=self._art_bytes; t.art_url=self._art_url
-            except: pass
-        except Exception as e: print(f"[smtc] {e}")
-        return t
-
-    def cmd(self, _: str, c: str):
-        if not self._mgr or not self._loop: return
-        try:
-            sess=self._mgr.get_current_session()
-            if not sess: return
-            cmds={"PlayPause":sess.try_toggle_play_pause_async,
-                  "Next":sess.try_skip_next_async,"Previous":sess.try_skip_previous_async}
-            fn=cmds.get(c)
-            if fn: self._loop.run_until_complete(fn())
-        except: pass
-
-    def seek(self, _: str, frac: float):
-        if not self._mgr or not self._loop: return
-        try:
-            sess=self._mgr.get_current_session()
-            if not sess: return
-            tl=sess.get_timeline_properties(); dur=tl.end_time.duration
-            self._loop.run_until_complete(sess.try_change_playback_position_async(int(dur*frac)))
-        except: pass
 
 
 class DemoBackend:
@@ -449,10 +237,7 @@ class DemoBackend:
 
 
 def _make_backend():
-    if IS_WIN:   return WindowsBackend() if WINRT_OK else DemoBackend()
-    if IS_MAC:   return MacBackend()
-    if IS_LIN or IS_BSD: return DBusBackend() if DBUS_OK else DemoBackend()
-    return DemoBackend()
+    return DBusBackend() if DBUS_OK else DemoBackend()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -571,16 +356,15 @@ def _play(p: QPainter, cx: float, cy: float, sz: float, col: QColor):
 
 
 def _pause(p: QPainter, cx: float, cy: float, sz: float, col: QColor):
-    """Material pause icon — two rounded bars."""
+    """Material pause icon — two plain rectangular bars, no rounding."""
     p.save(); p.setRenderHint(QPainter.RenderHint.Antialiasing)
     p.setBrush(QBrush(col)); p.setPen(Qt.PenStyle.NoPen)
     s = sz / 24.0
-    bw = 3.5 * s; bh = 10.5 * s; rr = bw * 0.45
-    # left bar centred at x=9, right bar at x=15 (SVG coords)
+    bw = 3.5 * s; bh = 10.5 * s
     lx = cx - 6.0*s; rx = cx + 2.5*s
     ty2 = cy - bh
-    p.drawRoundedRect(QRectF(lx,      ty2, bw, bh * 2), rr, rr)
-    p.drawRoundedRect(QRectF(rx,      ty2, bw, bh * 2), rr, rr)
+    p.drawRect(QRectF(lx, ty2, bw, bh * 2))
+    p.drawRect(QRectF(rx, ty2, bw, bh * 2))
     p.restore()
 
 
@@ -642,21 +426,17 @@ class IconBtn(QWidget):
     def paintEvent(self,_):
         p=QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
         s=self.width(); cx=s/2; cy=s/2; h=self._hov.cur; pr=self._prs.cur; sc=1-pr*.07
+        # No background circle — icon floats directly. Subtle hover glow only.
+        if h > 0.01:
+            glow = QRadialGradient(cx, cy, s/2)
+            gc = QColor(self._acc.cur); gc.setAlpha(int(35 * h))
+            glow.setColorAt(0, gc); gc2 = QColor(gc); gc2.setAlpha(0); glow.setColorAt(1, gc2)
+            p.fillRect(0, 0, s, s, QBrush(glow))
         if self._pri:
-            r=(s/2-3)*(1-pr*.04)
-            glow=QRadialGradient(cx,cy,r+14)
-            gc=QColor(self._acc.cur); gc.setAlpha(int(60*h)); glow.setColorAt(0,gc)
-            gc2=QColor(gc); gc2.setAlpha(0); glow.setColorAt(1,gc2)
-            p.fillRect(0,0,s,s,QBrush(glow))
-            fill=lerp_color(self._acc.cur,QColor(255,255,255),h*.14+pr*.07)
-            p.setBrush(QBrush(fill)); p.setPen(Qt.PenStyle.NoPen); p.drawEllipse(QPointF(cx,cy),r,r)
-            icon_c=QColor(255,255,255,245)
+            icon_c = QColor(self._acc.cur)
+            icon_c.setAlpha(int(200 + 55 * h - pr * 40))
         else:
-            if h>.01:
-                hc=QColor(self._acc.cur); hc.setAlpha(int(28*h))
-                p.setBrush(QBrush(hc)); p.setPen(Qt.PenStyle.NoPen)
-                r2=(s/2-2)*(.65+.35*h); p.drawEllipse(QPointF(cx,cy),r2,r2)
-            icon_c=QColor(self._fg.cur); icon_c.setAlpha(int(155+100*h))
+            icon_c = QColor(self._fg.cur); icon_c.setAlpha(int(150 + 105 * h))
         p.save(); p.translate(cx,cy); p.scale(sc,sc); p.translate(-cx,-cy)
         self.draw(p,cx,cy,s,icon_c); p.restore(); p.end()
 
@@ -687,13 +467,8 @@ class ProgBar(QWidget):
         p.drawRoundedRect(QRectF(0,y,w,bh),r,r)
         fw=w*self._prog.cur
         if fw>r:
-            g=QLinearGradient(0,0,fw,0); ac=QColor(self._acc.cur)
-            ac2=QColor.fromHsvF((ac.hsvHueF()+.08)%1.0,.90,1.0)
-            g.setColorAt(0,ac); g.setColorAt(1,ac2)
-            p.setBrush(QBrush(g)); p.drawRoundedRect(QRectF(0,y,fw,bh),r,r)
-            if h>.05:
-                p.setBrush(QBrush(QColor(255,255,255,int(220*h)))); p.setPen(Qt.PenStyle.NoPen)
-                p.drawEllipse(QPointF(fw,self.height()/2),4.5+2.5*h,4.5+2.5*h)
+            ac=QColor(self._acc.cur)
+            p.setBrush(QBrush(ac)); p.drawRoundedRect(QRectF(0,y,fw,bh),r,r)
         p.end()
 
 
@@ -837,7 +612,7 @@ class SettingsPanel(QWidget):
         # Save button tinted with accent
         dark_acc = QColor.fromHsvF(h, s*0.8, v*0.55).name()
         hover_acc= QColor.fromHsvF(h, s*0.75, min(1.0, v*0.75)).name()
-        btn=QPushButton("Save & Close")
+        btn=QPushButton("Save And Close")
         btn.setStyleSheet(f"""QPushButton{{background:{dark_acc};color:#fff;border:none;border-radius:8px;
             padding:7px 16px;font-size:12px;}}QPushButton:hover{{background:{hover_acc};}}
             QPushButton:pressed{{background:{fill_hex};}}""")
@@ -1258,24 +1033,8 @@ class MusicWidget(QWidget):
 #  Entry point
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
-    # Linux / BSD: prefer XCB under Wayland
-    if IS_UNIX and not IS_MAC:
-        if os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("QT_QPA_PLATFORM"):
-            os.environ.setdefault("QT_QPA_PLATFORM","xcb")
-
-    # Windows: per-monitor DPI awareness
-    if IS_WIN:
-        try:
-            import ctypes; ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        except: pass
-
-    # macOS: hide dock icon (desktop widget)
-    if IS_MAC:
-        try:
-            from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
-            NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
-        except: pass
-
+    if os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("QT_QPA_PLATFORM"):
+        os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
     app=QApplication(sys.argv)
     app.setApplicationName("Aurora Music Widget")
     app.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)

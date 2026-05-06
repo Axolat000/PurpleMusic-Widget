@@ -7,6 +7,8 @@
 [![openSUSE](https://img.shields.io/badge/openSUSE-supported-73ba25.svg?logo=opensuse&logoColor=white)](https://www.opensuse.org/)
 
 ---
+
+#THIS IS A FORK IN DEV
 # 🎵 Aurora Music Widget
 
 A beautiful floating music widget for Linux — frameless, always-on-top, with dynamic colors extracted from album art. Inspired by macOS widgets, Rainmeter, Hyprland rice setups, and the Spotify aesthetic.    
